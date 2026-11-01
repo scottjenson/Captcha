@@ -1,0 +1,445 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Captcha Tracker</title>
+<style>
+  :root {
+    --bg: #f4f5f7; --card: #fff; --ink: #1f2328; --muted: #6b7280;
+    --line: #d0d4da; --grid: #eceef1; --grid-major: #dadde2;
+    --path: #1a73e8; --ideal: #9aa0a6; --start: #188038; --hit: #d93025;
+    --peak: #e8710a; --dip: #9334e6; --entry: #129eaf; --up: #5f6368; --badge-ink: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c; --card: #1f2228; --ink: #e6e8eb; --muted: #9aa0a6;
+      --line: #3a3f47; --grid: #262a30; --grid-major: #333840;
+      --path: #8ab4f8; --ideal: #6b7280; --start: #81c995; --hit: #f28b82;
+      --peak: #fcad70; --dip: #c58af9; --entry: #78d9ec; --up: #bdc1c6; --badge-ink: #16181c;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+
+  /* Intro sits at the top so the trip to the centered checkbox is always a real reach */
+  .intro { max-width: 560px; margin: 0 auto; padding: 48px 16px 0; text-align: center; }
+  .intro h1 { font-size: 22px; margin: 0 0 8px; }
+  .intro p { color: var(--muted); margin: 0 0 16px; }
+
+  /* Stage: full viewport; the widget is dropped at a random spot on each test */
+  .stage { position: relative; height: 100vh; overflow: hidden; }
+  .widget {
+    position: absolute; display: flex; align-items: center; gap: 14px;
+    width: 300px; height: 76px; padding: 0 14px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 4px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.08);
+    user-select: none;
+  }
+  .box {
+    width: 28px; height: 28px; flex: none; cursor: pointer;
+    border: 2px solid #c1c1c1; border-radius: 3px; background: var(--card);
+    display: grid; place-items: center;
+  }
+  .box:hover { border-color: #b2b2b2; }
+  .box.busy {
+    border: 3px solid var(--line); border-top-color: var(--path); border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  .box.checked { border-color: transparent; }
+  .box.checked::after {
+    content: ""; width: 9px; height: 18px; margin-top: -4px;
+    border: solid var(--start); border-width: 0 4px 4px 0; transform: rotate(45deg);
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .label { flex: 1; }
+  .brand { font-size: 10px; color: var(--muted); text-align: center; line-height: 1.2; }
+
+  /* Results */
+  .results { display: none; max-width: 1000px; margin: 0 auto; padding: 24px 16px 64px; }
+  .results.show { display: block; }
+  h2 { font-size: 18px; margin: 28px 0 4px; }
+  .caption { color: var(--muted); margin: 0 0 10px; }
+  canvas {
+    display: block; width: 100%; background: var(--card);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  #pathCanvas { aspect-ratio: 16 / 10; }
+  #speedCanvas { aspect-ratio: 16 / 6; }
+  .note { color: var(--muted); }
+  .head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .head h2 { margin-top: 0; }
+  button {
+    font: inherit; padding: 8px 16px; cursor: pointer; flex: none;
+    background: var(--card); color: var(--ink); border: 1px solid var(--line); border-radius: 6px;
+  }
+</style>
+</head>
+<body>
+
+<section id="intro" class="intro">
+  <h1>Mouse tracker</h1>
+  <p>
+    This page records how your mouse travels to a checkbox, then shows you the path and its speed.
+    When you're ready, click Start test, then click the checkbox.
+  </p>
+  <button id="startBtn">Start test</button>
+</section>
+
+<section id="stage" class="stage" hidden>
+  <div class="widget">
+    <div id="box" class="box" role="checkbox" aria-checked="false" tabindex="0"></div>
+    <div class="label">I'm not a robot</div>
+    <div class="brand">Captcha<br>Tracker</div>
+  </div>
+</section>
+
+<section id="results" class="results">
+  <div class="head">
+    <div id="noPath" class="note" hidden></div>
+    <h2 id="pathTitle">Your approach to the checkbox</h2>
+    <button onclick="location.reload()">Try again</button>
+  </div>
+  <div id="charts">
+    <p class="caption">
+      Your final reach, blown up. Each dot is one mouse sample, so wide gaps mean fast motion.
+      The dashed line is the straight path a naive bot would take.
+    </p>
+    <canvas id="pathCanvas"></canvas>
+
+    <h2>Speed over time</h2>
+    <p class="caption">
+      Humans speed up, peak, then slow down to land on the target, often with a small correction at the end.
+      Numbered points match the same moments on the path above; the shaded band is the button held down.
+    </p>
+    <canvas id="speedCanvas"></canvas>
+  </div>
+</section>
+
+<script>
+  const PAUSE_MS = 250;  // a gap this long marks the start of the final reach
+  const SAMPLE_MS = 8;   // resampling interval for the speed curve
+  const MIN_TRAVEL = 250; // the random checkbox spot is at least this far from the Start click
+
+  const samples = [];    // {x, y, t} in page coordinates
+  let recording = false;
+  let down = null, up = null, analysis = null;
+
+  addEventListener('pointermove', e => {
+    if (!recording || e.pointerType === 'touch') return;
+    const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+    for (const c of evs.length ? evs : [e]) samples.push({ x: c.pageX, y: c.pageY, t: c.timeStamp });
+  });
+
+  const box = document.getElementById('box');
+
+  // Swap the intro for the checkbox at a random spot; the Start click is the first sample.
+  document.getElementById('startBtn').addEventListener('click', e => {
+    const b = e.currentTarget.getBoundingClientRect();
+    const sx = e.detail ? e.clientX : b.left + b.width / 2, sy = e.detail ? e.clientY : b.top + b.height / 2;
+    document.getElementById('intro').hidden = true;
+    document.getElementById('stage').hidden = false;
+    placeWidget(sx, sy);
+    samples.length = 0;
+    if (e.pointerType === 'mouse' || e.pointerType === 'pen') samples.push({ x: e.pageX, y: e.pageY, t: e.timeStamp });
+    recording = true;
+  });
+
+  function placeWidget(sx, sy) {
+    const widget = document.querySelector('.widget');
+    const maxX = Math.max(16, innerWidth - widget.offsetWidth - 16);
+    const maxY = Math.max(16, innerHeight - widget.offsetHeight - 16);
+    for (let i = 0; i < 50; i++) {
+      widget.style.left = `${16 + Math.random() * (maxX - 16)}px`;
+      widget.style.top = `${16 + Math.random() * (maxY - 16)}px`;
+      const r = box.getBoundingClientRect();
+      if (Math.hypot(r.left + r.width / 2 - sx, r.top + r.height / 2 - sy) >= MIN_TRAVEL) return;
+    }
+  }
+
+  box.addEventListener('pointerdown', e => {
+    if (!recording || down) return;
+    down = { x: e.pageX, y: e.pageY, t: e.timeStamp, type: e.pointerType };
+  });
+
+  // Keep recording through the press so any drift while the button is held shows up
+  addEventListener('pointerup', e => {
+    if (!down || up) return;
+    up = { x: e.pageX, y: e.pageY, t: e.timeStamp };
+    recording = false;
+  });
+
+  box.addEventListener('click', finish);
+  box.addEventListener('keydown', e => {
+    if (!recording) return;
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); recording = false; finish(); }
+  });
+
+  function finish() {
+    if (box.classList.contains('busy') || box.classList.contains('checked')) return;
+    box.classList.add('busy');
+    setTimeout(() => {
+      box.classList.remove('busy');
+      box.classList.add('checked');
+      box.setAttribute('aria-checked', 'true');
+      showResults();
+    }, 700);
+  }
+
+  function showResults() {
+    const results = document.getElementById('results');
+    results.classList.add('show');
+
+    const r = box.getBoundingClientRect();
+    const target = {
+      x: r.left + scrollX + r.width / 2, y: r.top + scrollY + r.height / 2,
+      left: r.left + scrollX, top: r.top + scrollY, w: r.width, h: r.height,
+    };
+
+    const seg = down && down.type !== 'touch' ? segment() : [];
+    if (seg.length < 3) {
+      const msg = document.getElementById('noPath');
+      msg.hidden = false;
+      msg.textContent = down && down.type === 'touch'
+        ? 'Touch screens have no hover, so there is no path to show. Try again with a mouse or trackpad.'
+        : 'Not enough mouse movement was recorded. Try again, moving the mouse to the checkbox and clicking it.';
+      document.getElementById('charts').hidden = true;
+      document.getElementById('pathTitle').hidden = true;
+    } else {
+      analysis = { seg, target };
+      draw();
+      addEventListener('resize', draw);
+    }
+    results.scrollIntoView({ behavior: 'smooth' });
+  }
+
+  // The reach: walk back from the last movement before mouse down until a pause.
+  // Any hover on the box before pressing is kept as a flat stretch, not treated as a pause.
+  // Then the press itself: mouse down, any drift while held, mouse up.
+  function segment() {
+    const before = samples.filter(p => p.t < down.t);
+    let i = before.length - 1;
+    while (i > 0 && before[i].t - before[i - 1].t <= PAUSE_MS) i--;
+    const held = samples.filter(p => p.t >= down.t && (!up || p.t <= up.t));
+    const seg = [...before.slice(Math.max(0, i)), { x: down.x, y: down.y, t: down.t }, ...held];
+    if (up) seg.push({ x: up.x, y: up.y, t: up.t });
+    return seg;
+  }
+
+  function draw() {
+    const { seg, target } = analysis;
+    const speed = speedSeries(seg);
+    const marks = findMarks(speed, target, seg[0].t);
+    drawPath(seg, target, marks);
+    drawSpeed(speed, marks);
+  }
+
+  // Key moments: start, each speed-up and slow-down (zigzag over 15% of top speed),
+  // entering the checkbox, mouse down and mouse up.
+  function findMarks(speed, target, t0) {
+    const last = speed.length - 1;
+    const at = t => Math.min(last, Math.max(0, Math.round((t - t0) / SAMPLE_MS)));
+    const downAt = at(down.t);
+    const th = Math.max(...speed.map(p => p.v)) * 0.15;
+    const picks = [];
+    let dir = 1, ext = 0;
+    for (let i = 1; i <= downAt; i++) {
+      const v = speed[i].v, e = speed[ext].v;
+      if (dir === 1) {
+        if (v > e) ext = i;
+        else if (e - v >= th) { picks.push({ i: ext, kind: 'peak' }); dir = -1; ext = i; }
+      } else {
+        if (v < e) ext = i;
+        else if (v - e >= th) { picks.push({ i: ext, kind: 'dip' }); dir = 1; ext = i; }
+      }
+    }
+    const near = 3; // drop turning points sitting on top of start or mouse down
+    const marks = picks.filter(p => p.i > near && p.i < downAt - near);
+    const inside = speed.findIndex(p =>
+      p.x >= target.left && p.x <= target.left + target.w && p.y >= target.top && p.y <= target.top + target.h);
+    if (inside > 0 && inside < downAt) marks.push({ i: inside, kind: 'entry' });
+    marks.push({ i: 0, kind: 'start' }, { i: downAt, kind: 'down', pt: down });
+    if (up) marks.push({ i: at(up.t), kind: 'up', pt: up });
+
+    const color = { start: '--start', peak: '--peak', dip: '--dip', entry: '--entry', down: '--hit', up: '--up' };
+    return marks.sort((a, b) => a.i - b.i).map((mk, n) => {
+      const p = speed[mk.i], pos = mk.pt || p;
+      return { n: n + 1, kind: mk.kind, t: p.t, v: p.v, x: pos.x, y: pos.y, color: css(color[mk.kind]) };
+    });
+  }
+
+  function badge(ctx, x, y, n, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(x, y, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = css('--badge-ink'); ctx.font = 'bold 11px system-ui, sans-serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(n, x, y + 0.5);
+  }
+
+  const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  function prep(canvas) {
+    const dpr = devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    return { ctx, w, h };
+  }
+
+  function drawPath(seg, target, marks) {
+    const { ctx, w, h } = prep(document.getElementById('pathCanvas'));
+
+    // Bounding box of the path and the checkbox, padded, scaled uniformly to fit
+    let minX = target.left, maxX = target.left + target.w, minY = target.top, maxY = target.top + target.h;
+    for (const p of seg) {
+      minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y);
+    }
+    const pad = 15;
+    minX -= pad; maxX += pad; minY -= pad; maxY += pad;
+    const s = Math.min(w / (maxX - minX), h / (maxY - minY));
+    const ox = (w - (maxX - minX) * s) / 2, oy = (h - (maxY - minY) * s) / 2;
+    const X = x => ox + (x - minX) * s, Y = y => oy + (y - minY) * s;
+
+    // Grid of 10 page px (50 when zoomed out on a long reach), darker every fifth line
+    const g = s * 10 >= 8 ? 10 : 50;
+    ctx.lineWidth = 1;
+    for (let gx = Math.ceil(minX / g) * g; gx <= maxX; gx += g) {
+      ctx.strokeStyle = gx % (g * 5) === 0 ? css('--grid-major') : css('--grid');
+      ctx.beginPath(); ctx.moveTo(X(gx), 0); ctx.lineTo(X(gx), h); ctx.stroke();
+    }
+    for (let gy = Math.ceil(minY / g) * g; gy <= maxY; gy += g) {
+      ctx.strokeStyle = gy % (g * 5) === 0 ? css('--grid-major') : css('--grid');
+      ctx.beginPath(); ctx.moveTo(0, Y(gy)); ctx.lineTo(w, Y(gy)); ctx.stroke();
+    }
+
+    // Checkbox outline and center
+    ctx.strokeStyle = css('--muted'); ctx.lineWidth = 2;
+    ctx.strokeRect(X(target.left), Y(target.top), target.w * s, target.h * s);
+    ctx.beginPath();
+    ctx.moveTo(X(target.x) - 6, Y(target.y)); ctx.lineTo(X(target.x) + 6, Y(target.y));
+    ctx.moveTo(X(target.x), Y(target.y) - 6); ctx.lineTo(X(target.x), Y(target.y) + 6);
+    ctx.lineWidth = 1; ctx.stroke();
+
+    const start = seg[0];
+
+    // Ideal straight line
+    ctx.setLineDash([6, 6]); ctx.strokeStyle = css('--ideal'); ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(X(start.x), Y(start.y)); ctx.lineTo(X(down.x), Y(down.y)); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Actual path
+    ctx.strokeStyle = css('--path'); ctx.lineWidth = 2; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    seg.forEach((p, i) => i ? ctx.lineTo(X(p.x), Y(p.y)) : ctx.moveTo(X(p.x), Y(p.y)));
+    ctx.stroke();
+    ctx.fillStyle = css('--path');
+    for (const p of seg) { ctx.beginPath(); ctx.arc(X(p.x), Y(p.y), 2.5, 0, Math.PI * 2); ctx.fill(); }
+
+    // Key moments: a ring on the exact point, numbered badge just beside it
+    // (mouse up goes below, since it usually lands right on top of mouse down)
+    for (const mk of marks) {
+      ctx.strokeStyle = mk.color; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(X(mk.x), Y(mk.y), 7, 0, Math.PI * 2); ctx.stroke();
+      badge(ctx, X(mk.x) + 15, Y(mk.y) + (mk.kind === 'up' ? 15 : -15), mk.n, mk.color);
+    }
+
+    // Legend
+    ctx.font = '13px system-ui, sans-serif'; ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+    const legend = [['--path', 'your path'], ['--ideal', 'straight line']];
+    let lx = 12;
+    for (const [c, label] of legend) {
+      ctx.fillStyle = css(c); ctx.fillRect(lx, 14, 12, 12);
+      ctx.fillStyle = css('--ink'); ctx.fillText(label, lx + 18, 20);
+      lx += ctx.measureText(label).width + 40;
+    }
+    ctx.fillStyle = css('--muted'); ctx.textAlign = 'right';
+    ctx.fillText(`grid ${g} px · ${s.toFixed(1)}× zoom`, w - 12, 20);
+    ctx.textAlign = 'left';
+  }
+
+  // Resample at a fixed interval, then take speed over a small window to tame jitter.
+  function speedSeries(seg) {
+    const dt = SAMPLE_MS, t0 = seg[0].t, t1 = seg[seg.length - 1].t, pos = [];
+    let j = 0;
+    for (let t = t0; t <= t1; t += dt) {
+      while (j < seg.length - 2 && seg[j + 1].t < t) j++;
+      const a = seg[j], b = seg[j + 1];
+      const f = b.t > a.t ? Math.min(1, Math.max(0, (t - a.t) / (b.t - a.t))) : 0;
+      pos.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f, t: t - t0 });
+    }
+    const k = 2;
+    return pos.map((p, i) => {
+      const a = pos[Math.max(0, i - k)], b = pos[Math.min(pos.length - 1, i + k)];
+      const span = b.t - a.t;
+      return { t: p.t, x: p.x, y: p.y, v: span ? Math.hypot(b.x - a.x, b.y - a.y) / span * 1000 : 0 };
+    });
+  }
+
+  function drawSpeed(speed, marks) {
+    const { ctx, w, h } = prep(document.getElementById('speedCanvas'));
+    const m = { l: 64, r: 16, t: 22, b: 36 };
+    const tMax = Math.max(1, speed[speed.length - 1].t);
+    const vMax = niceCeil(Math.max(1, ...speed.map(p => p.v)));
+    const X = t => m.l + t / tMax * (w - m.l - m.r);
+    const Y = v => h - m.b - v / vMax * (h - m.t - m.b);
+
+    ctx.font = '12px system-ui, sans-serif'; ctx.lineWidth = 1;
+    ctx.fillStyle = css('--muted');
+
+    // Horizontal grid + speed labels
+    ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const v = vMax * i / 4;
+      ctx.strokeStyle = css('--grid');
+      ctx.beginPath(); ctx.moveTo(m.l, Y(v)); ctx.lineTo(w - m.r, Y(v)); ctx.stroke();
+      ctx.fillText(Math.round(v), m.l - 8, Y(v));
+    }
+    // Time labels
+    ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    const step = niceCeil(tMax / 6);
+    for (let t = 0; t <= tMax; t += step) ctx.fillText(`${t} ms`, X(t), h - m.b + 8);
+
+    ctx.save(); ctx.translate(16, (m.t + h - m.b) / 2); ctx.rotate(-Math.PI / 2);
+    ctx.textBaseline = 'middle'; ctx.fillText('px / s', 0, 0); ctx.restore();
+
+    // Button held: band from mouse down to mouse up
+    const md = marks.find(mk => mk.kind === 'down'), mu = marks.find(mk => mk.kind === 'up');
+    if (md && mu) {
+      ctx.globalAlpha = 0.12; ctx.fillStyle = css('--hit');
+      ctx.fillRect(X(md.t), m.t, X(mu.t) - X(md.t), h - m.t - m.b);
+      ctx.globalAlpha = 1;
+    }
+
+    // Filled curve
+    ctx.beginPath(); ctx.moveTo(X(0), Y(0));
+    for (const p of speed) ctx.lineTo(X(p.t), Y(p.v));
+    ctx.lineTo(X(tMax), Y(0)); ctx.closePath();
+    ctx.globalAlpha = 0.15; ctx.fillStyle = css('--path'); ctx.fill(); ctx.globalAlpha = 1;
+    ctx.beginPath();
+    speed.forEach((p, i) => i ? ctx.lineTo(X(p.t), Y(p.v)) : ctx.moveTo(X(p.t), Y(p.v)));
+    ctx.strokeStyle = css('--path'); ctx.lineWidth = 2; ctx.stroke();
+
+    // Key moments: dashed guide down to the time axis, badge on the curve
+    for (const mk of marks) {
+      const x = X(mk.t);
+      ctx.setLineDash([3, 4]); ctx.strokeStyle = mk.color; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, m.t); ctx.lineTo(x, h - m.b); ctx.stroke();
+      ctx.setLineDash([]);
+      badge(ctx, x, Y(mk.v), mk.n, mk.color);
+    }
+  }
+
+  function niceCeil(x) {
+    const p = 10 ** Math.floor(Math.log10(x)), n = x / p;
+    return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
+  }
+</script>
+</body>
+</html>
